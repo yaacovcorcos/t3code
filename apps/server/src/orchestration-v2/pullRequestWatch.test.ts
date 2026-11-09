@@ -453,6 +453,57 @@ describe("evaluatePullRequestWatch", () => {
     );
   });
 
+  it("stays quiet when the queue lets go of a pull request by merging it", () => {
+    const watching = evaluatePullRequestWatch(watch(), detail(), noRemarks).next;
+    // GitHub stamps this removal up to a second before the pull request reads as merged.
+    const merging = detail({
+      mergeQueueRemoval: { id: "landed", removedAt: "2026-10-02T12:10:00Z", reason: "merged" },
+    });
+    const read = evaluatePullRequestWatch(watching, merging, noRemarks);
+    assert.deepEqual(read.changes, []);
+    assert.equal(read.next.mergeQueueRemovalId, "landed");
+  });
+
+  it("explains GitHub's removal reasons in the wake", () => {
+    const watching = evaluatePullRequestWatch(watch(), detail(), noRemarks).next;
+    const wakeLine = (reason: string | null) => {
+      const report = evaluatePullRequestWatch(
+        watching,
+        detail({
+          mergeQueueRemoval: { id: "dropped", removedAt: "2026-10-02T12:10:00Z", reason },
+        }),
+        noRemarks,
+      );
+      return pullRequestWatchMessage({
+        number: 1,
+        url: "https://github.com/o/r/pull/1",
+        baseBranch: "main",
+        headSha: report.next.headSha,
+        report,
+      })
+        .text.split("\n")
+        .find((line) => line.startsWith("- "));
+    };
+    assert.equal(
+      wakeLine("failed_checks"),
+      "- The merge queue removed it because its checks failed. They ran on the queue's own commit, not on this head, so look for the failures in the queue's runs.",
+    );
+    assert.equal(
+      wakeLine("checks_timed_out"),
+      "- The merge queue removed it because its checks did not finish in time. They ran on the queue's own commit, not on this head, so look in the queue's runs for the check that did not finish.",
+    );
+    assert.equal(
+      wakeLine("merge_conflict"),
+      "- The merge queue removed it because it conflicts with the queue's base.",
+    );
+    assert.equal(wakeLine("manual"), "- It was taken out of the merge queue by hand.");
+    assert.equal(
+      wakeLine("some_new_reason"),
+      "- It was removed from the merge queue without merging: some_new_reason.",
+    );
+    assert.equal(wakeLine(null), "- It was removed from the merge queue without merging.");
+  });
+
   it("does not spend the comment wake limit on check results", () => {
     const tired = watch({ headSha: "aaaaaaaaaa", wakes: PULL_REQUEST_WATCH_WAKE_LIMIT - 1 });
     const result = evaluatePullRequestWatch(

@@ -149,6 +149,8 @@ export function evaluatePullRequestWatch(
   const removal = detail.mergeQueueRemoval;
   if (
     removal !== undefined &&
+    // Merging also records a removal, up to a second before the pull request reads as merged.
+    removal.reason !== "merged" &&
     removal.id !== watch.mergeQueueRemovalId &&
     (watch.mergeQueueRemovalId !== undefined ||
       Date.parse(removal.removedAt) >= Math.floor(Date.parse(watch.startedAt) / 1000) * 1000)
@@ -235,10 +237,26 @@ function changeLines(
       return [`- The branch now conflicts with ${context.baseBranch}.`];
     case "merge-queue-removed":
       return [
-        `- It was removed from the merge queue without merging${change.reason === null ? "" : `: ${change.reason}`}.`,
+        `- ${
+          (change.reason === null ? undefined : MERGE_QUEUE_REMOVALS.get(change.reason)) ??
+          `It was removed from the merge queue without merging${change.reason === null ? "" : `: ${change.reason}`}.`
+        }`,
       ];
   }
 }
+
+const MERGE_QUEUE_REMOVALS = new Map([
+  [
+    "failed_checks",
+    "The merge queue removed it because its checks failed. They ran on the queue's own commit, not on this head, so look for the failures in the queue's runs.",
+  ],
+  [
+    "checks_timed_out",
+    "The merge queue removed it because its checks did not finish in time. They ran on the queue's own commit, not on this head, so look in the queue's runs for the check that did not finish.",
+  ],
+  ["merge_conflict", "The merge queue removed it because it conflicts with the queue's base."],
+  ["manual", "It was taken out of the merge queue by hand."],
+]);
 
 const SUMMARY: Record<PullRequestWatchChange["kind"], string> = {
   "checks-failed": "checks failed",
