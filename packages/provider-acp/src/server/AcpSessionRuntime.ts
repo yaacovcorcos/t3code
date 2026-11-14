@@ -622,10 +622,12 @@ function makeLinuxProcessTreeController(): AcpPosixProcessTreeController {
         return identity === undefined ? [] : [identity];
       }),
     identity: readLinuxProcessIdentity,
+    // Names only: for an entry of unknown type Node falls back to lstat, which fails if that
+    // process exits mid-scan and would abort the whole snapshot.
     snapshot: () =>
-      NodeFS.readdirSync("/proc", { withFileTypes: true }).flatMap((entry) => {
-        if (!entry.isDirectory() || !/^[1-9][0-9]*$/.test(entry.name)) return [];
-        const identity = readLinuxProcessIdentity(Number(entry.name));
+      NodeFS.readdirSync("/proc").flatMap((entry) => {
+        if (!/^[1-9][0-9]*$/.test(entry)) return [];
+        const identity = readLinuxProcessIdentity(Number(entry));
         return identity === undefined ? [] : [identity];
       }),
     signalProcess: (pid, signal) => process.kill(pid, signal),
