@@ -737,6 +737,95 @@ it.effect("a launch that omits its workspace follows the new-threads-in-a-worktr
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect("a launch whose HEAD check fails refuses instead of sharing the checkout", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const repo = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-launch-head-probe-" });
+    const exit = (exitCode: number, stdout = "", stderr = "") => ({
+      exitCode: ChildProcessSpawner.ExitCode(exitCode),
+      stdout,
+      stderr,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    });
+    const timedOut = (operation: string, cwd: string) =>
+      new GitCommandError({ operation, command: "git", cwd, detail: "Git command timed out." });
+    // What Git answers when asked whether HEAD names a commit.
+    const headProbes = {
+      timeout: null,
+      refused: exit(128, "", `fatal: detected dubious ownership in repository at '${repo}'`),
+      "missing-gitdir": exit(
+        128,
+        "",
+        `fatal: not a git repository: ${repo}/../main/.git/worktrees/x`,
+      ),
+      unborn: exit(1),
+      // HEAD names a commit whose object is gone, so only the commit check exits 1.
+      "missing-object": exit(1),
+      "not-a-repository": exit(
+        128,
+        "",
+        "fatal: not a git repository (or any of the parent directories): .git",
+      ),
+    } as const;
+    const launchedFor = Effect.fn(function* (probe: keyof typeof headProbes) {
+      const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];
+      const { projectId, dependencies } = clientLaunchHarness({
+        runtimeModeCeiling: "auto",
+        launched,
+        workspaceRoot: repo,
+        defaultThreadEnvMode: "worktree",
+      });
+      const answer = headProbes[probe];
+      const git = Layer.mock(GitVcsDriver.GitVcsDriver)({
+        resolveCommit: (input) =>
+          Effect.fail(
+            answer === null
+              ? timedOut("GitVcsDriver.resolveCommit", input.cwd)
+              : new GitCommandError({
+                  operation: "GitVcsDriver.resolveCommit",
+                  command: "git",
+                  cwd: input.cwd,
+                  detail: answer.stderr || "Needed a single revision",
+                }),
+          ),
+        execute: (input) =>
+          input.args[0] === "rev-parse"
+            ? answer === null
+              ? Effect.fail(timedOut(input.operation, input.cwd))
+              : Effect.succeed(
+                  probe === "missing-object" && input.args.at(-1) === "HEAD"
+                    ? exit(0, "abc123\n")
+                    : answer,
+                )
+            : Effect.succeed(exit(0, "main\n")),
+      });
+      const withGit = Layer.merge(dependencies, git);
+      const toolkit = yield* ProjectToolkit.pipe(
+        Effect.provide(
+          McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer).pipe(Layer.provide(withGit)),
+        ),
+      );
+      const result = (yield* toolkit
+        .handle("t3_thread_launch", { title: "Fix", projectId })
+        .pipe(Stream.unwrap, Stream.runCollect, Effect.provide(withGit))).at(-1)?.result;
+      return { result, strategies: launched.map((launch) => launch.workspaceStrategy.type) };
+    });
+
+    // A check that never answered, a checkout Git refuses, a worktree whose gitdir is gone or a
+    // HEAD whose commit object is missing is no proof that HEAD has no commit.
+    for (const probe of ["timeout", "refused", "missing-gitdir", "missing-object"] as const) {
+      const { result, strategies } = yield* launchedFor(probe);
+      expect(strategies, probe).toEqual([]);
+      expect(result, probe).toMatchObject({ code: "orchestration_error" });
+    }
+    // Git's own answer still keeps a checkout without a commit shared.
+    for (const probe of ["unborn", "not-a-repository"] as const) {
+      expect((yield* launchedFor(probe)).strategies, probe).toEqual(["root"]);
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect("a launch into a new worktree creates nothing when its branch collides", () =>
   Effect.gen(function* () {
     const launched: Array<ThreadLaunch.ThreadLaunchInput> = [];

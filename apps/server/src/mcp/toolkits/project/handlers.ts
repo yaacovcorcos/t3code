@@ -123,11 +123,37 @@ const defaultWorktreeStrategy = Effect.fn("mcp.defaultWorktreeStrategy")(functio
   GitVcsDriver.GitVcsDriver
 > {
   const git = yield* GitVcsDriver.GitVcsDriver;
-  const hasCommit = yield* git.resolveCommit({ cwd: workspaceRoot, revision: "HEAD" }).pipe(
-    Effect.as(true),
-    Effect.orElseSucceed(() => false),
-  );
-  if (!hasCommit) return undefined;
+  // Only Git's own answer means no commit; a check that never ran is no proof.
+  const revParse = (revision: string) =>
+    git
+      .execute({
+        operation: "mcp.defaultWorktreeStrategy",
+        cwd: workspaceRoot,
+        args: ["rev-parse", "--verify", "--quiet", revision],
+        env: { LC_ALL: "C" },
+        allowNonZeroExit: true,
+        timeoutMs: 5_000,
+      })
+      .pipe(Effect.orElseSucceed(() => null));
+  const commit = yield* revParse("HEAD^{commit}");
+  // Exit 128 is no repository only with Git's own search message: a checkout Git refuses (such
+  // as dubious ownership) or a worktree whose gitdir is gone exits 128 too.
+  const notRepository =
+    commit?.exitCode === 128 &&
+    commit.stderr
+      .split("\n")
+      .some((line) => line.startsWith("fatal: not a git repository (or any"));
+  // A HEAD whose commit object is missing exits 1 like an unborn one; only a HEAD that names
+  // nothing is unborn.
+  const unborn = commit?.exitCode === 1 && (yield* revParse("HEAD"))?.exitCode === 1;
+  const noCommit = notRepository || unborn;
+  if (noCommit) return undefined;
+  if (commit === null || commit.exitCode !== 0)
+    return yield* new OrchestratorMcpFailure({
+      code: "orchestration_error",
+      message:
+        "Could not read the project's current commit for the new worktree. No thread was created. Retry, or pass workspaceStrategy.",
+    });
   // symbolic-ref skips the index, so a held index lock cannot drop the launch into the shared checkout.
   const head = yield* git
     .execute({
