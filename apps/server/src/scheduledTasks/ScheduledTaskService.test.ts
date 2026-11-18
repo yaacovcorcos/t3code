@@ -580,6 +580,83 @@ it.effect("a one-time task is removed once its turn completes", () =>
   }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
 );
 
+it.effect("Run now on a paused one-time task keeps it; a due run still removes its task", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse("2026-11-01T07:00:00.000Z"));
+    const projectId = ProjectId.make("project:test");
+    const ended = yield* Deferred.make<void>();
+    const sent = yield* Ref.make(new Map<string, string>());
+    const run = { id: "run:1", status: "completed", rootNodeId: "node:root" };
+    const layer = ScheduledTaskService.layer.pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          ManagedPolicy.layerTest(),
+          Layer.mock(ThreadLaunchService.ThreadLaunchService)({}),
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            sendToThread: (input) =>
+              Ref.update(sent, (all) => new Map(all).set(input.threadId, input.messageId)).pipe(
+                Effect.as({} as never),
+              ),
+            getThreadShell: () => Effect.succeed(threadShell(projectId)),
+            getProjectThreadRecords: (thread) =>
+              Effect.map(
+                Ref.get(sent),
+                (all) => ({ runs: [{ ...run, userMessageId: all.get(thread.threadId) }] }) as never,
+              ),
+            waitForThread: (input) =>
+              Deferred.await(ended).pipe(
+                Effect.as({ threadId: input.threadId, run, timedOut: false } as never),
+              ),
+          }),
+          Layer.mock(SecretRequests.SecretRequests)({}),
+          Layer.mock(ManagedProjectFolders.ManagedProjectFolders)({
+            namedProjectsRoot: "/projects",
+            isScratchProject: () => Effect.succeed(false),
+          }),
+          NodeCrypto.layer,
+          Scheduler.layer,
+        ),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ScheduledTaskService.ScheduledTaskService;
+      const task = (id: string, enabled: boolean, runAt: string) =>
+        service.upsert({
+          id: ScheduledTaskId.make(id),
+          title: id,
+          prompt: "Draft the release notes",
+          enabled,
+          schedule: { type: "once", runAt },
+          projectId,
+          threadId: ThreadId.make(`thread:${id}`),
+          workspaceStrategy: { type: "root" },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        });
+      // A paused task has no next run, like a used-up one; only the due task is used up.
+      const paused = (yield* task("task:paused", false, "2026-12-01T07:00:00.000Z")).task;
+      const due = (yield* task("task:due", true, "2026-11-01T07:01:00.000Z")).task;
+      yield* Deferred.succeed(ended, undefined);
+
+      yield* service.runNow({ id: paused.id });
+      const dueRemoved = yield* service.subscribeList().pipe(
+        Stream.filter(({ tasks }) => tasks.every((candidate) => candidate.id !== due.id)),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      // The paused run's outcome is ready before the due run starts, so it has settled by the
+      // time the due task's removal is seen.
+      yield* TestClock.adjust("2 minutes");
+      yield* Fiber.join(dueRemoved);
+
+      const kept = (yield* service.list()).tasks.find((candidate) => candidate.id === paused.id);
+      assert.equal(kept?.lastRunStatus, "succeeded");
+      assert.equal(kept?.schedule.type, "once");
+    }).pipe(Effect.provide(layer));
+  }).pipe(Effect.provide(SqlitePersistence.layerMemory)),
+);
+
 it.effect("a bound run follows its thread when promotion moves it mid-send", () =>
   Effect.gen(function* () {
     const scratch = ProjectId.make("project:scratch");
