@@ -105,6 +105,8 @@ export interface PiRpcConnection {
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const TERMINATION_GRACE = Duration.seconds(1);
+// Process groups have no exit event, so the grace checks for the group's members this often.
+const TERMINATION_EXIT_POLL = Duration.millis(20);
 
 interface PendingPiRequest {
   readonly deferred: Deferred.Deferred<unknown, PiRpcError>;
@@ -189,18 +191,22 @@ function parsePiRecord(line: string): PiRpcRecord | undefined {
 }
 
 /**
- * `hasExited` is consulted before each signal. Once the original child is
- * gone its pid/pgid can be recycled by the OS, so escalating blindly could
- * deliver SIGKILL to an unrelated process.
+ * `hasExited` guards SIGTERM and SIGKILL: once the original child is gone its pid/pgid can be
+ * recycled, so escalating blindly could SIGKILL an unrelated process. `groupGone` ends the grace
+ * early when no member of the group is left; a group seen gone is never escalated.
  */
-const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
+export const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
   kill: (signal: NodeJS.Signals) => boolean,
   hasExited: () => boolean,
+  groupGone: () => boolean,
 ) {
   if (hasExited()) return;
   if (!kill("SIGTERM")) return;
-  yield* Effect.sleep(TERMINATION_GRACE);
-  if (hasExited()) return;
+  const gone = yield* Effect.sleep(TERMINATION_EXIT_POLL).pipe(
+    Effect.repeat({ until: groupGone }),
+    Effect.timeoutOption(TERMINATION_GRACE),
+  );
+  if (Option.isSome(gone) || hasExited()) return;
   kill("SIGKILL");
 });
 
@@ -253,6 +259,16 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
     }
   };
 
+  // Only "no such process" proves the group empty; EPERM means a member still runs.
+  const groupGone = (): boolean => {
+    try {
+      signalProcessGroup(Number(child.pid), 0);
+      return false;
+    } catch (cause) {
+      return (cause as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  };
+
   // Windows process.kill leaves extension children and pipes alive; taskkill /T reaps the tree.
   const terminateWindowsTree = Effect.gen(function* () {
     if (hasExited()) return;
@@ -263,7 +279,9 @@ export const makePiRpcConnection = Effect.fnUntraced(function* (options: PiRpcSp
   }).pipe(Effect.scoped, Effect.ignore);
 
   const terminateProcess =
-    platform === "win32" ? terminateWindowsTree : terminatePiProcess(killProcessGroup, hasExited);
+    platform === "win32"
+      ? terminateWindowsTree
+      : terminatePiProcess(killProcessGroup, hasExited, groupGone);
 
   // Register teardown immediately after spawn so interrupted setup cannot leak a detached process.
   yield* Scope.addFinalizer(scope, terminateProcess.pipe(Effect.ignore, Effect.uninterruptible));
