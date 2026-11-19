@@ -15,6 +15,7 @@ import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Semaphore from "effect/Semaphore";
 import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -508,6 +509,9 @@ export const AntigravityDriver: ProviderDriver<
         }),
     });
 
+    // One catalog read at a time, so a read started before a runtime install can never
+    // publish its older list after the post-install read.
+    const refreshGate = yield* Semaphore.make(1);
     const refreshModels = Effect.fn("AntigravityDriver.refreshModels")(
       function* () {
         const processScope = yield* Scope.make();
@@ -583,7 +587,7 @@ export const AntigravityDriver: ProviderDriver<
       orchestrationAdapter,
       textGeneration,
       auth: authFlow.controller,
-      refreshModels,
+      refreshModels: () => refreshGate.withPermits(1)(refreshModels()),
     } satisfies ProviderInstance;
   }),
 };
