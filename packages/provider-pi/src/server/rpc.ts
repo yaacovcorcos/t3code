@@ -194,18 +194,19 @@ function parsePiRecord(line: string): PiRpcRecord | undefined {
  * gone its pid/pgid can be recycled by the OS, so escalating blindly could
  * deliver SIGKILL to an unrelated process.
  */
-const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
+export const terminatePiProcess = Effect.fn("PiRpc.terminatePiProcess")(function* (
   kill: (signal: NodeJS.Signals) => boolean,
   hasExited: () => boolean,
   groupGone: () => boolean,
 ) {
   if (hasExited()) return;
   if (!kill("SIGTERM")) return;
-  yield* Effect.sleep(TERMINATION_POLL_INTERVAL).pipe(
+  const gone = yield* Effect.sleep(TERMINATION_POLL_INTERVAL).pipe(
     Effect.repeat({ until: groupGone }),
     Effect.timeoutOption(TERMINATION_GRACE),
   );
-  if (hasExited()) return;
+  // An empty group frees its id, so a later probe may find a different group under it.
+  if (Option.isSome(gone) || hasExited()) return;
   kill("SIGKILL");
 });
 
